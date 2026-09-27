@@ -1,0 +1,6 @@
+*.old
+*.mod
+*.sum
+*.tmp
+*.json
+_*.*

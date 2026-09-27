@@ -1,0 +1,61 @@
+# DHT Exporter systemd unit file
+#
+# Install to: /etc/systemd/system/dht-exporter.service
+# Or use: make install
+#
+# The exporter communicates with systemd via sd_notify (Type=exec).
+# It needs CAP_SYS_MODULE to load the kernel driver via modprobe
+# if it is not already loaded at service startup.
+#
+# The --json option (if used) should point to a path under
+# /var/lib/dht-exporter/ (the StateDirectory), since ProtectSystem=strict
+# makes most of the filesystem read-only.
+
+[Unit]
+Description=DHT Prometheus Exporter
+Documentation=https://github.com/Chapvic/dht-driver
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/dht-exporter
+
+# Restart policy: restart on unexpected exit, but not on clean shutdown
+Restart=on-failure
+RestartSec=5
+
+# Run as a dedicated unprivileged user
+User=dht-exporter
+Group=dht-exporter
+
+# Allow loading kernel modules (modprobe dht) without root privileges.
+# CAP_SYS_MODULE is required for the modprobe system call.
+AmbientCapabilities=CAP_SYS_MODULE
+CapabilityBoundingSet=CAP_SYS_MODULE
+
+# Security hardening
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=no
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+# Allow the exporter to write JSON output files to its state directory
+StateDirectory=dht-exporter
+ReadWritePaths=/var/lib/dht-exporter
+
+# Resource limits (the exporter is lightweight: ~10MB RSS)
+MemoryMax=64M
+
+# Logging: redirect stdout/stderr to systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dht-exporter
+
+[Install]
+WantedBy=multi-user.target
