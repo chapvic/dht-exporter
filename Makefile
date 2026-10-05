@@ -22,11 +22,13 @@
 BINARY   = dht-exporter
 SRC      = dht-exporter.go
 UNIT     = dht-exporter.service
+CONF     = dht-exporter.default
 
 # Installation paths
 PREFIX   = /usr/local
 BIN_DIR  = $(PREFIX)/bin
 UNIT_DIR = /etc/systemd/system
+CONF_DIR = /etc/default
 
 # Service user (created during install, removed during uninstall)
 USER     = dht-exporter
@@ -63,6 +65,8 @@ install: $(BINARY) $(UNIT)
 	install -m 755 $(BINARY) $(BIN_DIR)/$(BINARY)
 	# Install the systemd unit file
 	install -m 644 $(UNIT) $(UNIT_DIR)/$(UNIT)
+	# Install the configuration file
+	install -m 644 $(CONF) $(CONF_DIR)/dht-exporter
 	# Create the dedicated service user (no login, no shell)
 	useradd -r -s /bin/false $(USER) 2>/dev/null || true
 	# Reload systemd to pick up the new unit file
@@ -83,6 +87,8 @@ uninstall:
 	rm -f $(BIN_DIR)/$(BINARY)
 	# Remove the unit file
 	rm -f $(UNIT_DIR)/$(UNIT)
+	# Remove the configuration file
+	rm -f $(CONF_DIR)/dht-exporter
 	# Remove the dedicated user
 	userdel $(USER) 2>/dev/null || true
 	# Reload systemd to forget the removed unit file

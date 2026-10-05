@@ -10,7 +10,7 @@
  *
  * Copyright (c) 2026, Chapvic
  *
- * Version: 1.0
+ * Version: 1.1
  *
  * License: GPLv3
  *
@@ -20,6 +20,10 @@
  *   - Optional JSON file output for integration with other tools
  *   - Dynamic interval tracking: monitors driver's auto_interval
  *     and adjusts polling automatically when the driver changes it
+ *   - Config file support: reads /etc/default/dht-exporter (PARAMS="...")
+ *     with CLI arguments overriding config values
+ *   - Driver interval control: when --interval is explicitly specified,
+ *     writes the value back to the driver's auto_interval procfs file
  *   - Graceful shutdown on SIGINT/SIGTERM with clean ticker cleanup
  *   - ANSI color logging in terminal, plain text in redirected output
  *   - Sensor name sanitization with hostname fallback
@@ -33,12 +37,17 @@
  * Options:
  *   --name <name>      Exporter name label (default: hostname)
  *   --addr <addr>      HTTP listen address (default: 0.0.0.0:9988)
- *   --interval <sec>   Poll interval 2-60, 0 = use driver value (default: 10)
+ *   --interval <sec>   Poll interval 2-60 (default: 10)
+ *                      When specified, writes value to driver's auto_interval
  *   --json <path>      Write JSON output to file (default: disabled)
  *   --driver <name>    Kernel module name for modprobe (default: dht)
  *   --rt <sec>         HTTP read timeout 1-60 (default: 5)
  *   --wt <sec>         HTTP write timeout 1-120, >= --rt (default: 10)
  *   --help             Show help message
+ *
+ * Config file:
+ *   /etc/default/dht-exporter  PARAMS="--interval 15 ..."
+ *   Config params are parsed first; CLI arguments override them.
  *
  * Endpoints:
  *   /metrics           Prometheus metrics
@@ -73,7 +82,7 @@ import (
 )
 
 /* Version */
-const version = "1.0"
+const version = "1.1"
 
 /* Defaults and limits */
 const (
@@ -90,6 +99,7 @@ const (
 	maxWriteTO       = 120
 	procBaseDir      = "/proc/sensors/dht"
 	autoIntervalFile = "/proc/sensors/dht/auto_interval"
+	configFile       = "/etc/default/dht-exporter"
 )
 
 /* Logging */
@@ -206,8 +216,9 @@ type sensorReading struct {
 type exporter struct {
 	name         string
 	addr         string
-	interval     int
-	jsonPath     string
+	interval         int
+	intervalExplicit bool
+	jsonPath         string
 	driverName   string
 	readTimeout  int
 	writeTimeout int
@@ -269,6 +280,99 @@ func readAutoInterval() int {
 		return -1
 	}
 	return val
+}
+
+/*
+ * writeAutoInterval writes the interval value back to the driver's
+ * auto_interval procfs file. This allows the exporter to control the
+ * driver's polling interval when --interval is explicitly specified.
+ * Returns nil on success, error on failure.
+ */
+func writeAutoInterval(interval int) error {
+	err := os.WriteFile(autoIntervalFile, []byte(strconv.Itoa(interval)), 0644)
+	if err != nil {
+		logWarn("cannot write auto_interval: %v", err)
+		return err
+	}
+	return nil
+}
+
+/*
+ * readConfigParams reads the config file /etc/default/dht-exporter and
+ * extracts the PARAMS="..." value, tokenizing it into an argv-style slice.
+ * Returns (params, found) where found indicates whether the file was
+ * readable and contained a PARAMS= line. The params slice is empty if
+ * the file was not found or had no PARAMS= directive.
+ *
+ * Tokenization supports double and single quotes for arguments containing
+ * spaces, matching the C implementation's shell-like splitting.
+ */
+func readConfigParams() ([]string, bool) {
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		return nil, false
+	}
+
+	var paramsVal string
+	for _, line := range strings.Split(string(data), "\n") {
+		s := strings.TrimSpace(line)
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		if strings.HasPrefix(s, "PARAMS=") {
+			paramsVal = s[len("PARAMS="):]
+			/* Strip surrounding quotes (double or single) */
+			if len(paramsVal) >= 2 {
+				if (paramsVal[0] == '"' && paramsVal[len(paramsVal)-1] == '"') ||
+					(paramsVal[0] == '\'' && paramsVal[len(paramsVal)-1] == '\'') {
+					paramsVal = paramsVal[1 : len(paramsVal)-1]
+				}
+			}
+			break
+		}
+	}
+
+	if paramsVal == "" {
+		return nil, true /* file found, but no PARAMS */
+	}
+
+	/* Tokenize: shell-like splitting with quote support */
+	var tokens []string
+	p := 0
+	for p < len(paramsVal) {
+		/* Skip whitespace */
+		for p < len(paramsVal) && (paramsVal[p] == ' ' || paramsVal[p] == '\t' || paramsVal[p] == '\n' || paramsVal[p] == '\r') {
+			p++
+		}
+		if p >= len(paramsVal) {
+			break
+		}
+
+		var token strings.Builder
+		if paramsVal[p] == '"' || paramsVal[p] == '\'' {
+			quote := paramsVal[p]
+			p++
+			for p < len(paramsVal) && paramsVal[p] != quote {
+				token.WriteByte(paramsVal[p])
+				p++
+			}
+			if p < len(paramsVal) {
+				p++ /* skip closing quote */
+			}
+		} else {
+			for p < len(paramsVal) && paramsVal[p] != ' ' && paramsVal[p] != '\t' && paramsVal[p] != '\n' && paramsVal[p] != '\r' {
+				token.WriteByte(paramsVal[p])
+				p++
+			}
+		}
+		tokens = append(tokens, token.String())
+	}
+
+	if len(tokens) == 0 {
+		return nil, true
+	}
+
+	return tokens, true
 }
 
 /*
@@ -613,22 +717,13 @@ func logSensorReadings(readings []sensorReading, prevCount int, isFirst bool) {
  * Stops when the stopCh channel is closed.
  */
 func pollLoop(e *exporter, stopCh <-chan struct{}) {
-	// Validate interval: must be 2-60, 0 means "use driver value"
+	// Interval is already resolved in main()
 	interval := e.interval
-	if interval < minInterval || interval > maxInterval {
-		if interval != 0 {
-			logWarn("interval %d is outside valid range %d-%d, falling back to driver value", interval, minInterval, maxInterval)
-		}
-		interval = 0
-	}
 
-	// If interval is 0, try to read from driver
-	if interval == 0 {
-		driverInterval := readAutoInterval()
-		if driverInterval >= minInterval && driverInterval <= maxInterval {
-			interval = driverInterval
-		} else {
-			interval = defaultInterval
+	// Write to driver only if user explicitly specified --interval
+	if e.intervalExplicit {
+		if err := writeAutoInterval(interval); err == nil {
+			logInfo("driver interval set to %d seconds", interval)
 		}
 	}
 
@@ -675,7 +770,8 @@ func pollLoop(e *exporter, stopCh <-chan struct{}) {
 			if driverInterval >= minInterval && driverInterval <= maxInterval {
 				if driverInterval != lastDriverInterval && lastDriverInterval >= 0 {
 					logInfo("driver interval changed: %d -> %d, adjusting", lastDriverInterval, driverInterval)
-					ticker.Reset(time.Duration(driverInterval) * time.Second)
+					interval = driverInterval
+					ticker.Reset(time.Duration(interval) * time.Second)
 				}
 				lastDriverInterval = driverInterval
 			}
@@ -747,9 +843,10 @@ Options:
                        (default: 0.0.0.0:9988)
 
   --interval <sec>     Polling interval in seconds.
-                       Valid range: 2-60. Values outside this range produce
-                       a warning and fall back to the driver's auto_interval.
-                       If the driver is unavailable, defaults to 10.
+                       Valid range: 2-60. When explicitly specified, the
+                       value is written back to the driver's auto_interval.
+                       If not specified, reads from the driver's auto_interval;
+                       if the driver is unavailable, defaults to 10.
                        The exporter continuously monitors the driver's
                        auto_interval and adjusts automatically if it changes.
                        (default: 10)
@@ -778,6 +875,10 @@ Prometheus metrics:
   dht_timestamp_seconds    Unix timestamp of last measurement
   dht_info                 Sensor info (always 1)
 
+Config file:
+  /etc/default/dht-exporter  Optional config file (PARAMS="--interval 15 ...")
+  Config params are parsed first; CLI arguments override them.
+
 Endpoints:
   /metrics    Prometheus metrics
   /health     Health check (returns 200 OK)
@@ -791,6 +892,14 @@ License: GNU GPLv3
 `, version)
 }
 
+/* boolStr returns one of two strings based on a boolean condition */
+func boolStr(cond bool, trueVal, falseVal string) string {
+	if cond {
+		return trueVal
+	}
+	return falseVal
+}
+
 /* main */
 func main() {
 	/* Parse command-line arguments */
@@ -802,7 +911,22 @@ func main() {
 		writeTimeout: defaultWriteTO,
 	}
 
+	/*
+	 * Read config file /etc/default/dht-exporter (PARAMS=...).
+	 * Config params are parsed first; CLI arguments override them
+	 * (CLI args come after in the merged list, so last wins).
+	 */
+	configParams, configFound := readConfigParams()
+
+	/* Build merged args: config_params + cli_args (CLI overrides config) */
 	args := os.Args[1:]
+	if configFound && len(configParams) > 0 {
+		merged := make([]string, 0, len(configParams)+len(args))
+		merged = append(merged, configParams...)
+		merged = append(merged, args...)
+		args = merged
+	}
+
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch arg {
@@ -827,6 +951,7 @@ func main() {
 					os.Exit(1)
 				}
 				e.interval = val
+				e.intervalExplicit = true
 				i++
 			}
 		case "--json":
@@ -897,11 +1022,34 @@ func main() {
 	/* Attempt to load driver if needed */
 	ensureDriver(e.driverName)
 
+	/*
+	 * Resolve interval before printing banner.
+	 * If --interval was explicitly specified, validate range and write
+	 * back to the driver. If not explicit, read from the driver.
+	 */
+	if e.intervalExplicit {
+		if e.interval < minInterval || e.interval > maxInterval {
+			logWarn("interval %d is outside valid range %d-%d, falling back to default %d",
+				e.interval, minInterval, maxInterval, defaultInterval)
+			e.interval = defaultInterval
+			e.intervalExplicit = false
+		}
+	}
+	if !e.intervalExplicit {
+		driverIv := readAutoInterval()
+		if driverIv >= minInterval && driverIv <= maxInterval {
+			e.interval = driverIv
+		} else {
+			e.interval = defaultInterval
+		}
+	}
+
 	/* Print startup banner */
 	logInfo("DHT Exporter (v%s) starting...", version)
 	logInfo("  name:      %s", e.name)
 	logInfo("  address:   %s", e.addr)
-	logInfo("  interval:  %d seconds", e.interval)
+	logInfo("  interval:  %d seconds (%s)", e.interval,
+		boolStr(e.intervalExplicit, "explicit", "from driver"))
 	logInfo("  driver:    %s", e.driverName)
 	if e.jsonPath != "" {
 		logInfo("  json:      %s", e.jsonPath)
@@ -910,6 +1058,7 @@ func main() {
 	}
 	logInfo("  timeouts:  read=%ds, write=%ds", e.readTimeout, e.writeTimeout)
 	logInfo("  procfs:    %s", procBaseDir)
+	logInfo("  config:    %s (%s)", configFile, boolStr(configFound, "found", "not found"))
 
 	/* Validate JSON path after banner */
 	if e.jsonPath != "" {
